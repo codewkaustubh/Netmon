@@ -1,14 +1,14 @@
 package main
 
 import (
-	"context"       // lets us set timeouts/cancellation on requests
-	"encoding/json" // parse targets.json
+	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
-	"os/signal" // lets us listen for Ctrl+C
+	"os/signal"
 	"sync"
-	"syscall" // defines the specific signal types (like SIGINT for Ctrl+C)
+	"syscall"
 	"time"
 )
 
@@ -18,6 +18,78 @@ type Result struct {
 	Status  int
 	Elapsed time.Duration
 	Err     error
+}
+
+// TargetState remembers what we last knew about a target, so we can
+// detect when something CHANGES (up -> down, or down -> up).
+type TargetState struct {
+	IsUp                bool      // true if the last check succeeded
+	ConsecutiveFailures int       // how many checks in a row have failed
+	LastChanged         time.Time // when did IsUp last flip?
+}
+
+// Monitor bundles together everything the whole program needs to share
+// safely across goroutines: the state map itself, AND a Mutex to protect it.
+type Monitor struct {
+	mu     sync.Mutex              // the "lock" - protects the map below
+	states map[string]*TargetState // name -> current known state
+}
+
+// NewMonitor creates a Monitor with an empty, initialized states map.
+func NewMonitor() *Monitor {
+	return &Monitor{
+		states: make(map[string]*TargetState),
+	}
+}
+
+// update takes a fresh Result and updates our stored state for that target.
+// It returns true if the target's up/down status CHANGED since last time,
+// so the caller knows whether to print an alert.
+func (m *Monitor) update(r Result) (changed bool, newState TargetState) {
+	// Lock before touching the shared map - only one goroutine can be
+	// inside this function's critical section at a time.
+	m.mu.Lock()
+	defer m.mu.Unlock() // guarantees we unlock even if we return early
+
+	isUp := r.Err == nil // no error means the check succeeded
+
+	// Look up existing state for this target, if we have one yet.
+	state, exists := m.states[r.Name]
+
+	if !exists {
+		// First time seeing this target - create a fresh state entry.
+		state = &TargetState{
+			IsUp:        isUp,
+			LastChanged: time.Now(),
+		}
+		m.states[r.Name] = state
+
+		if !isUp {
+			state.ConsecutiveFailures = 1
+		}
+
+		// We treat the very first check as "changed" so it gets printed once.
+		return true, *state
+	}
+
+	// Did the up/down status flip since last time?
+	statusChanged := state.IsUp != isUp
+
+	if statusChanged {
+		state.IsUp = isUp
+		state.LastChanged = time.Now()
+	}
+
+	if isUp {
+		state.ConsecutiveFailures = 0
+	} else {
+		state.ConsecutiveFailures = state.ConsecutiveFailures + 1
+	}
+
+	// Return a COPY of the state (*state dereferences the pointer to copy
+	// the struct's current values) so the caller can print details safely
+	// without needing to hold the lock themselves.
+	return statusChanged, *state
 }
 
 func loadTargets(path string) (map[string]string, error) {
@@ -33,30 +105,20 @@ func loadTargets(path string) (map[string]string, error) {
 	return targets, nil
 }
 
-// checkURL now takes a "ctx context.Context" parameter - this carries the
-// timeout information. Instead of using http.Get (which has no timeout
-// built in), we build the request manually so we can attach the context.
 func checkURL(ctx context.Context, name, url string, results chan<- Result, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	start := time.Now()
-
-	// Build an HTTP request "tied to" our context (ctx). If ctx's timeout
-	// expires before the server responds, this request will be cancelled
-	// automatically instead of hanging forever.
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		results <- Result{Name: name, URL: url, Err: err}
 		return
 	}
 
-	// http.DefaultClient.Do actually sends the request (this is what
-	// http.Get was doing internally, but now it respects our context/timeout).
 	resp, err := http.DefaultClient.Do(req)
 	elapsed := time.Since(start)
 
 	if err != nil {
-		// If the timeout expired, this error will mention "context deadline exceeded"
 		results <- Result{Name: name, URL: url, Err: err}
 		return
 	}
@@ -65,23 +127,16 @@ func checkURL(ctx context.Context, name, url string, results chan<- Result, wg *
 	results <- Result{Name: name, URL: url, Status: resp.StatusCode, Elapsed: elapsed}
 }
 
-// runChecks performs ONE full round of checking all targets concurrently,
-// and prints the results. This is basically our old main() logic, now
-// pulled out into its own function so the Ticker loop can call it repeatedly.
-func runChecks(targets map[string]string) {
+// runChecks now takes a *Monitor so it can update shared state and decide
+// whether to print an alert for each result.
+func runChecks(targets map[string]string, monitor *Monitor) {
 	results := make(chan Result)
 	var wg sync.WaitGroup
 
 	for name, url := range targets {
 		wg.Add(1)
-
-		// context.WithTimeout creates a context that automatically "expires"
-		// after the given duration (5 seconds here). "cancel" is a function
-		// we MUST call to release resources associated with the context,
-		// even if it already expired naturally - hence the defer below.
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel() // clean up this context once runChecks returns
-
+		defer cancel()
 		go checkURL(ctx, name, url, results, &wg)
 	}
 
@@ -91,10 +146,20 @@ func runChecks(targets map[string]string) {
 	}()
 
 	for r := range results {
-		if r.Err != nil {
-			fmt.Printf("[%s] %s -> ERROR: %v\n", r.Name, r.URL, r.Err)
+		// Feed this result into the monitor; find out if status changed.
+		changed, state := monitor.update(r)
+
+		if !changed {
+			// Nothing changed - skip printing to avoid spam. (You could
+			// still log this somewhere later, but for now we stay quiet.)
+			continue
+		}
+
+		// Something changed - print an alert-style message.
+		if state.IsUp {
+			fmt.Printf("[ALERT] %s (%s) is now UP (took %v)\n", r.Name, r.URL, r.Elapsed)
 		} else {
-			fmt.Printf("[%s] %s -> status %d, took %v\n", r.Name, r.URL, r.Status, r.Elapsed)
+			fmt.Printf("[ALERT] %s (%s) is now DOWN: %v\n", r.Name, r.URL, r.Err)
 		}
 	}
 }
@@ -106,34 +171,25 @@ func main() {
 		return
 	}
 
-	// Create a ticker that "fires" every 5 seconds. ticker.C is a channel
-	// that receives a value each time the interval elapses.
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop() // always stop a ticker when done, to free resources
+	// Create one shared Monitor for the whole program's lifetime.
+	monitor := NewMonitor()
 
-	// Create a channel to receive OS interrupt signals (like Ctrl+C).
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
 	stop := make(chan os.Signal, 1)
-	// signal.Notify tells Go "send SIGINT (Ctrl+C) or SIGTERM notifications
-	// into the 'stop' channel instead of just killing the program immediately."
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	fmt.Println("netmon started. Checking every 5 seconds. Press Ctrl+C to stop.")
 
-	// Run one round of checks immediately, so we don't wait 5 seconds
-	// before seeing any output at all.
-	runChecks(targets)
+	runChecks(targets, monitor)
 
-	// This is the main event loop. "select" waits for ONE of multiple
-	// channels to have something ready, and runs the matching case.
 	for {
 		select {
 		case <-ticker.C:
-			// The ticker fired - time for another round of checks.
-			fmt.Println("\n--- running checks ---")
-			runChecks(targets)
+			runChecks(targets, monitor)
 
 		case <-stop:
-			// We received Ctrl+C (or a termination signal) - exit cleanly.
 			fmt.Println("\nshutting down netmon...")
 			return
 		}
