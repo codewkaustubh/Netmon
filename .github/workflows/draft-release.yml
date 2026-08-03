@@ -1,0 +1,92 @@
+name: Build and create draft release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to create the release for (if using workflow_dispatch)'
+        required: false
+      release_name:
+        description: 'Optional release name'
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    env:
+      GOFLAGS: -mod=mod
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Ensure tag is set
+        env:
+          TAG: ${{ github.ref_name || github.event.inputs.tag }}
+        run: |
+          if [ -z "$TAG" ]; then
+            echo "Error: tag is not set. When using workflow_dispatch pass the 'tag' input or run this workflow by pushing a tag (v*)."
+            exit 1
+          fi
+
+      - name: Build binaries
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          PKG=./
+          for OS in linux darwin windows; do
+            for ARCH in amd64 arm64; do
+              BIN_NAME=netmon-${OS}-${ARCH}
+              EXT=""
+              if [ "$OS" = "windows" ]; then EXT=".exe"; fi
+              echo "Building ${BIN_NAME}${EXT}"
+              GOOS=$OS GOARCH=$ARCH go build -ldflags "-s -w" -o dist/${BIN_NAME}${EXT} $PKG
+              if [ "$OS" != "windows" ]; then chmod +x dist/${BIN_NAME}${EXT}; fi
+            done
+          done
+
+      - name: Create draft release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name || github.event.inputs.tag }}
+          release_name: ${{ github.event.inputs.release_name || github.ref_name || github.event.inputs.tag }}
+          draft: true
+          prerelease: false
+          body: |
+            Draft release created by GitHub Actions (built binaries are attached).
+
+      - name: Upload release assets
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPLOAD_URL: ${{ steps.create_release.outputs.upload_url }}
+        run: |
+          set -euo pipefail
+          if [ -z "$UPLOAD_URL" ]; then
+            echo "No upload_url from create-release step; aborting upload."
+            exit 1
+          fi
+          # Upload every file in dist/ as a release asset
+          for f in dist/*; do
+            if [ -f "$f" ]; then
+              filename=$(basename "$f")
+              echo "Uploading $filename"
+              curl -s -X POST \
+                -H "Authorization: token $GITHUB_TOKEN" \
+                -H "Content-Type: application/octet-stream" \
+                --data-binary @"$f" "${UPLOAD_URL}?name=${filename}"
+            fi
+          done
