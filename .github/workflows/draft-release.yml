@@ -7,8 +7,8 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to create the release for (if using workflow_dispatch)'
-        required: false
+        description: 'Tag to create the release for (e.g. v1.0.0)'
+        required: true
       release_name:
         description: 'Optional release name'
         required: false
@@ -26,18 +26,34 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v5
         with:
           go-version: '1.21'
+          # Set cache to false if your project does not have a go.sum file
+          cache: false
 
-      - name: Ensure tag is set
-        env:
-          TAG: ${{ github.ref_name || github.event.inputs.tag }}
+      - name: Resolve tag and release name
+        id: vars
         run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+            TITLE="${{ github.event.inputs.release_name }}"
+          else
+            TAG="${{ github.ref_name }}"
+            TITLE=""
+          fi
+
           if [ -z "$TAG" ]; then
-            echo "Error: tag is not set. When using workflow_dispatch pass the 'tag' input or run this workflow by pushing a tag (v*)."
+            echo "Error: Tag is not set."
             exit 1
           fi
+
+          if [ -z "$TITLE" ]; then
+            TITLE="$TAG"
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
 
       - name: Build binaries
         run: |
@@ -55,38 +71,13 @@ jobs:
             done
           done
 
-      - name: Create draft release
-        id: create_release
-        uses: actions/create-release@v1
+      - name: Create draft release and upload assets
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref_name || github.event.inputs.tag }}
-          release_name: ${{ github.event.inputs.release_name || github.ref_name || github.event.inputs.tag }}
-          draft: true
-          prerelease: false
-          body: |
-            Draft release created by GitHub Actions (built binaries are attached).
-
-      - name: Upload release assets
-        if: always()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          UPLOAD_URL: ${{ steps.create_release.outputs.upload_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.vars.outputs.tag }}
+          TITLE: ${{ steps.vars.outputs.title }}
         run: |
-          set -euo pipefail
-          if [ -z "$UPLOAD_URL" ]; then
-            echo "No upload_url from create-release step; aborting upload."
-            exit 1
-          fi
-          # Upload every file in dist/ as a release asset
-          for f in dist/*; do
-            if [ -f "$f" ]; then
-              filename=$(basename "$f")
-              echo "Uploading $filename"
-              curl -s -X POST \
-                -H "Authorization: token $GITHUB_TOKEN" \
-                -H "Content-Type: application/octet-stream" \
-                --data-binary @"$f" "${UPLOAD_URL}?name=${filename}"
-            fi
-          done
+          gh release create "$TAG" dist/* \
+            --draft \
+            --title "$TITLE" \
+            --notes "Draft release created by GitHub Actions (built binaries are attached)."
