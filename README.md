@@ -4,7 +4,7 @@ A concurrent network health monitor and alerting CLI, written in Go.
 
 `netmon` watches a list of targets — HTTP(S) endpoints or raw TCP ports — checks them all **concurrently** on a fixed interval, tracks their up/down state over time, and prints an alert only when a target's status actually **changes**. Think of it as a tiny, personal version of tools like Nagios or Prometheus's blackbox exporter.
 
-> This project was built during my internship at **Softorage**, as a hands-on way to learn Go — specifically its concurrency model, including goroutines, channels, and mutex locks.
+> This project was built during my internship at **Softorage**, as a hands-on way to learn Go — specifically its concurrency model, including goroutines, channels, and mutex locks, along with an introduction to GitHub, GitHub Actions and Releases.
 
 ## Features
 
