@@ -1,5 +1,6 @@
 {
-  "google": "https://google.com",
-  "github": "https://github.com",
-  "broken_site": "https://thisdoesnotexist12345.com"
+  "google": { "type": "http", "target": "https://google.com" },
+  "github": { "type": "http", "target": "https://github.com" },
+  "broken_site": { "type": "http", "target": "https://thisdoesnotexist12345.com" },
+  "local_ssh": { "type": "tcp", "target": "127.0.0.1:22" }
 }

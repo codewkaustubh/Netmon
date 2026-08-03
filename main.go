@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,90 +15,72 @@ import (
 
 type Result struct {
 	Name    string
-	URL     string
-	Status  int
+	Target  string
+	Status  int // only meaningful for HTTP checks; 0 for TCP
 	Elapsed time.Duration
 	Err     error
 }
 
-// TargetState remembers what we last knew about a target, so we can
-// detect when something CHANGES (up -> down, or down -> up).
 type TargetState struct {
-	IsUp                bool      // true if the last check succeeded
-	ConsecutiveFailures int       // how many checks in a row have failed
-	LastChanged         time.Time // when did IsUp last flip?
+	IsUp                bool
+	ConsecutiveFailures int
+	LastChanged         time.Time
 }
 
-// Monitor bundles together everything the whole program needs to share
-// safely across goroutines: the state map itself, AND a Mutex to protect it.
 type Monitor struct {
-	mu     sync.Mutex              // the "lock" - protects the map below
-	states map[string]*TargetState // name -> current known state
+	mu     sync.Mutex
+	states map[string]*TargetState
 }
 
-// NewMonitor creates a Monitor with an empty, initialized states map.
 func NewMonitor() *Monitor {
-	return &Monitor{
-		states: make(map[string]*TargetState),
-	}
+	return &Monitor{states: make(map[string]*TargetState)}
 }
 
-// update takes a fresh Result and updates our stored state for that target.
-// It returns true if the target's up/down status CHANGED since last time,
-// so the caller knows whether to print an alert.
 func (m *Monitor) update(r Result) (changed bool, newState TargetState) {
-	// Lock before touching the shared map - only one goroutine can be
-	// inside this function's critical section at a time.
 	m.mu.Lock()
-	defer m.mu.Unlock() // guarantees we unlock even if we return early
+	defer m.mu.Unlock()
 
-	isUp := r.Err == nil // no error means the check succeeded
-
-	// Look up existing state for this target, if we have one yet.
+	isUp := r.Err == nil
 	state, exists := m.states[r.Name]
 
 	if !exists {
-		// First time seeing this target - create a fresh state entry.
-		state = &TargetState{
-			IsUp:        isUp,
-			LastChanged: time.Now(),
-		}
+		state = &TargetState{IsUp: isUp, LastChanged: time.Now()}
 		m.states[r.Name] = state
-
 		if !isUp {
 			state.ConsecutiveFailures = 1
 		}
-
-		// We treat the very first check as "changed" so it gets printed once.
 		return true, *state
 	}
 
-	// Did the up/down status flip since last time?
 	statusChanged := state.IsUp != isUp
-
 	if statusChanged {
 		state.IsUp = isUp
 		state.LastChanged = time.Now()
 	}
-
 	if isUp {
 		state.ConsecutiveFailures = 0
 	} else {
-		state.ConsecutiveFailures = state.ConsecutiveFailures + 1
+		state.ConsecutiveFailures++
 	}
 
-	// Return a COPY of the state (*state dereferences the pointer to copy
-	// the struct's current values) so the caller can print details safely
-	// without needing to hold the lock themselves.
 	return statusChanged, *state
 }
 
-func loadTargets(path string) (map[string]string, error) {
+// Target now describes HOW to check something (its "Type": "http" or "tcp")
+// and WHAT to check (its "Target": a URL or a host:port string).
+type Target struct {
+	Type   string `json:"type"`   // "http" or "tcp" - the json tags tell
+	Target string `json:"target"` // encoding/json which JSON field maps to which Go field
+}
+
+// loadTargets now returns a map of name -> Target (instead of name -> string),
+// since each target now carries both a type and a value.
+func loadTargets(path string) (map[string]Target, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	var targets map[string]string
+	var targets map[string]Target
 	err = json.Unmarshal(data, &targets)
 	if err != nil {
 		return nil, err
@@ -105,13 +88,14 @@ func loadTargets(path string) (map[string]string, error) {
 	return targets, nil
 }
 
-func checkURL(ctx context.Context, name, url string, results chan<- Result, wg *sync.WaitGroup) {
+// checkHTTP performs an HTTP GET check, same as before.
+func checkHTTP(ctx context.Context, name, url string, results chan<- Result, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	start := time.Now()
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		results <- Result{Name: name, URL: url, Err: err}
+		results <- Result{Name: name, Target: url, Err: err}
 		return
 	}
 
@@ -119,25 +103,61 @@ func checkURL(ctx context.Context, name, url string, results chan<- Result, wg *
 	elapsed := time.Since(start)
 
 	if err != nil {
-		results <- Result{Name: name, URL: url, Err: err}
+		results <- Result{Name: name, Target: url, Err: err}
 		return
 	}
 	defer resp.Body.Close()
 
-	results <- Result{Name: name, URL: url, Status: resp.StatusCode, Elapsed: elapsed}
+	results <- Result{Name: name, Target: url, Status: resp.StatusCode, Elapsed: elapsed}
 }
 
-// runChecks now takes a *Monitor so it can update shared state and decide
-// whether to print an alert for each result.
-func runChecks(targets map[string]string, monitor *Monitor) {
+// checkTCP attempts a raw TCP connection to "host:port". If it connects
+// successfully, the target is considered "up" - we don't care about any
+// data, just whether the connection opened at all.
+func checkTCP(ctx context.Context, name, hostport string, results chan<- Result, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	start := time.Now()
+
+	// net.Dialer lets us dial WITH a context, so our timeout still applies
+	// here just like it does for HTTP checks.
+	dialer := net.Dialer{}
+	conn, err := dialer.DialContext(ctx, "tcp", hostport)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		results <- Result{Name: name, Target: hostport, Err: err}
+		return
+	}
+	// We successfully connected - close the connection immediately,
+	// we only needed to prove it opens, not use it.
+	conn.Close()
+
+	results <- Result{Name: name, Target: hostport, Elapsed: elapsed}
+}
+
+// runChecks now looks at each target's Type to decide which checker to use.
+func runChecks(targets map[string]Target, monitor *Monitor) {
 	results := make(chan Result)
 	var wg sync.WaitGroup
 
-	for name, url := range targets {
+	for name, t := range targets {
 		wg.Add(1)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		go checkURL(ctx, name, url, results, &wg)
+
+		// Dispatch to the right checker function based on the "type" field.
+		switch t.Type {
+		case "http":
+			go checkHTTP(ctx, name, t.Target, results, &wg)
+		case "tcp":
+			go checkTCP(ctx, name, t.Target, results, &wg)
+		default:
+			// Unknown type - treat as an immediate failure, but we still
+			// need to call wg.Done() and send a result, or things hang.
+			wg.Done()
+			results <- Result{Name: name, Target: t.Target, Err: fmt.Errorf("unknown target type: %s", t.Type)}
+		}
 	}
 
 	go func() {
@@ -146,20 +166,14 @@ func runChecks(targets map[string]string, monitor *Monitor) {
 	}()
 
 	for r := range results {
-		// Feed this result into the monitor; find out if status changed.
 		changed, state := monitor.update(r)
-
 		if !changed {
-			// Nothing changed - skip printing to avoid spam. (You could
-			// still log this somewhere later, but for now we stay quiet.)
 			continue
 		}
-
-		// Something changed - print an alert-style message.
 		if state.IsUp {
-			fmt.Printf("[ALERT] %s (%s) is now UP (took %v)\n", r.Name, r.URL, r.Elapsed)
+			fmt.Printf("[ALERT] %s (%s) is now UP (took %v)\n", r.Name, r.Target, r.Elapsed)
 		} else {
-			fmt.Printf("[ALERT] %s (%s) is now DOWN: %v\n", r.Name, r.URL, r.Err)
+			fmt.Printf("[ALERT] %s (%s) is now DOWN: %v\n", r.Name, r.Target, r.Err)
 		}
 	}
 }
@@ -171,7 +185,6 @@ func main() {
 		return
 	}
 
-	// Create one shared Monitor for the whole program's lifetime.
 	monitor := NewMonitor()
 
 	ticker := time.NewTicker(5 * time.Second)
@@ -188,7 +201,6 @@ func main() {
 		select {
 		case <-ticker.C:
 			runChecks(targets, monitor)
-
 		case <-stop:
 			fmt.Println("\nshutting down netmon...")
 			return
